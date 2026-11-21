@@ -1,0 +1,16 @@
+[package]
+name = "mines-core"
+version = "0.2.0"
+authors = ["Tyler Colby"]
+edition = "2021"
+description = "Pure logic for Minesweeper: minefield, first-click-safe placement, flood fill, game clock, cell glyphs, best times. No Xous dependencies."
+license = "Apache-2.0"
+
+# Keep this crate free of xous/gam/pddb so `cargo test` runs on any machine.
+[dependencies]
+precursor-appkit-core = { git = "https://github.com/tbcolby/xous-dev-toolkit" }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+precursor-appkit-core = { git = "https://github.com/tbcolby/xous-dev-toolkit", features = ["testing"] }
