@@ -1,140 +1,95 @@
-//! Precursor Minesweeper
-//!
-//! TRNG-powered mine placement on a 1-bit display.
-//! The universe places the mines. You find them.
-
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
-extern crate alloc;
+//! Minesweeper for Precursor. Board rules, placement, the game clock, cell
+//! geometry and best times live in `mines-core` (host-tested). This file routes
+//! messages; `app.rs` maps keys, saves and draws.
 
 mod app;
-mod minefield;
-mod rng;
-mod storage;
-mod ui;
 
-use app::MinesApp;
-use rng::Rng;
-use num_traits::FromPrimitive;
-use num_traits::ToPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
+use precursor_appkit::{app as kit, keys, pump, rng, store};
 
-const SERVER_NAME: &str = "_Minesweeper_";
-const APP_NAME: &str = "Mines";
+/// xous-names server name. Any unique string; NOT the GAM app name.
+const SERVER_NAME: &str = "_Mines_";
+
+/// The on-screen clock only needs whole seconds.
+const PUMP_MS: usize = 1000;
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
-enum AppOp {
+pub(crate) enum AppOp {
     Redraw = 0,
-    Rawkeys = 1,
-    FocusChange = 2,
-    Quit = 255,
+    Rawkeys,
+    FocusChange,
+    /// Blocking scalar from the pump; answered with `pump::ack`.
+    Tick,
+    BasisChanged,
+    Quit,
 }
 
 fn main() -> ! {
     log_server::init_wait().unwrap();
     log::set_max_level(log::LevelFilter::Info);
-    log::info!("Minesweeper starting, PID {}", xous::process::id());
+    log::info!("mines PID is {}", xous::process::id());
 
     let xns = xous_names::XousNames::new().unwrap();
-    let sid = xns
-        .register_name(SERVER_NAME, None)
-        .expect("can't register server");
+    let sid = xns.register_name(SERVER_NAME, None).expect("can't register server");
 
-    let gam = gam::Gam::new(&xns).expect("can't connect to GAM");
-    let rng = Rng::new(&xns);
-    let tt = ticktimer_server::Ticktimer::new().unwrap();
+    // GAM app name comes from apps/manifest.json key "mines".
+    let reg = kit::register(
+        &xns,
+        sid,
+        gam::APP_NAME_MINES,
+        gam::UxType::Framebuffer,
+        kit::Opcodes {
+            redraw: AppOp::Redraw.to_u32().unwrap(),
+            rawkeys: Some(AppOp::Rawkeys.to_u32().unwrap()),
+            focus_change: Some(AppOp::FocusChange.to_u32().unwrap()),
+            got_input: None,
+        },
+    );
 
-    let token = gam
-        .register_ux(gam::UxRegistration {
-            app_name: alloc::string::String::from(APP_NAME),
-            ux_type: gam::UxType::Chat,
-            predictor: None,
-            listener: sid.to_array(),
-            redraw_id: AppOp::Redraw.to_u32().unwrap(),
-            gotinput_id: None,
-            audioframe_id: None,
-            rawkeys_id: Some(AppOp::Rawkeys.to_u32().unwrap()),
-            focuschange_id: Some(AppOp::FocusChange.to_u32().unwrap()),
-        })
-        .expect("couldn't register UX")
-        .unwrap();
+    let trng = rng::Trng::new(&xns).expect("can't connect to TRNG");
+    let store = store::Store::open(app::DICT);
+    store::watch_bases(xous::connect(sid).unwrap(), AppOp::BasisChanged.to_usize().unwrap());
+    let pump = pump::Pump::spawn(xous::connect(sid).unwrap(), AppOp::Tick.to_usize().unwrap(), PUMP_MS);
 
-    let content = gam
-        .request_content_canvas(token)
-        .expect("couldn't get canvas");
-    let screensize = gam
-        .get_canvas_bounds(content)
-        .expect("couldn't get dimensions");
-    log::info!("Canvas size: {:?}", screensize);
-
-    let mut app = MinesApp::new();
-    app.init_storage();
-    let mut allow_redraw = true;
-
-    ui::draw(&app, &gam, content);
+    let mut app = app::App::new(reg.screen, store, trng);
 
     loop {
         let msg = xous::receive_message(sid).unwrap();
         match FromPrimitive::from_usize(msg.body.id()) {
-            Some(AppOp::Redraw) => {
-                if allow_redraw {
-                    // Update timer
-                    app.update_timer(tt.elapsed_ms());
-                    app.needs_redraw = true;
-                    ui::draw(&app, &gam, content);
-                }
-            }
+            Some(AppOp::Redraw) => app.redraw(),
             Some(AppOp::Rawkeys) => xous::msg_scalar_unpack!(msg, k1, k2, k3, k4, {
-                let keys = [
-                    core::char::from_u32(k1 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k2 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k3 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k4 as u32).unwrap_or('\u{0000}'),
-                ];
-
-                let now_ms = tt.elapsed_ms();
-                let mut should_quit = false;
-
-                for &key in keys.iter() {
-                    if key != '\u{0000}' {
-                        if !app.handle_key(key, &rng, now_ms) {
-                            should_quit = true;
-                            break;
-                        }
+                for key in keys::decode_rawkeys([k1, k2, k3, k4]) {
+                    if app.on_key(key) == app::Action::Leave {
+                        app.save();
+                        kit::leave(app.screen());
                     }
-                }
-
-                if should_quit {
-                    break;
-                }
-
-                // Update timer on every key event
-                app.update_timer(now_ms);
-
-                if app.needs_redraw && allow_redraw {
-                    ui::draw(&app, &gam, content);
-                    app.needs_redraw = false;
                 }
             }),
-            Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, state_code, _, _, _, {
-                match gam::FocusState::convert_focus_change(state_code) {
-                    gam::FocusState::Background => {
-                        allow_redraw = false;
-                        app.save_state();
-                    }
+            Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, code, _, _, _, {
+                match kit::focus_state(code) {
                     gam::FocusState::Foreground => {
-                        allow_redraw = true;
-                        ui::draw(&app, &gam, content);
+                        app.on_foreground();
+                        pump.run();
+                    }
+                    gam::FocusState::Background => {
+                        pump.stop();
+                        app.on_background();
                     }
                 }
             }),
+            Some(AppOp::Tick) => {
+                app.on_tick();
+                pump::ack(&msg);
+            }
+            Some(AppOp::BasisChanged) => app.reload(),
             Some(AppOp::Quit) => break,
-            _ => log::warn!("unknown opcode: {:?}", msg.body.id()),
+            None => log::warn!("unknown opcode {:?}", msg.body.id()),
         }
     }
-
-    app.save_state();
-    xns.unregister_server(sid).unwrap();
-    xous::destroy_server(sid).unwrap();
-    xous::terminate_process(0)
+    app.on_background();
+    pump.quit();
+    kit::shutdown(&xns, sid)
 }

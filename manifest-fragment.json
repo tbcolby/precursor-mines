@@ -1,0 +1,14 @@
+{
+    "mines": {
+        "context_name": "Mines",
+        "menu_name": {
+            "appmenu.mines": {
+                "en": "Mines",
+                "en-tts": "Mines",
+                "fr": "Mines",
+                "ja": "Mines",
+                "zh": "Mines"
+            }
+        }
+    }
+}
